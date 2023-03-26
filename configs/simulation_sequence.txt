@@ -1,9 +1,8 @@
 dataset_type = llff
-datadir = data/example_sequence/
+datadir = data/ball_sequence_multiview/
 
 rootdir = experiments/
-expname =  experiment_1
-
+expname =  experiment_2
 debug = False
 
 ray_bending = simple_neural # None, simple_neural

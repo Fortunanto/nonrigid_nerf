@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 #from load_llff import load_llff_data_multi_view
-from load_llff import load_llff_data
-
+from load_llff import load_llff_data,load_llff_data_multi_view
+from data_loader import get_simulation_collision_dataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEBUG = True  # gets overwritten by args.debug
@@ -160,7 +160,7 @@ class training_wrapper_class(torch.nn.Module):
         global_step,
         start,
         dataset_extras,
-        batch_pixel_indices,
+        metadata
     ):
 
         # necessary to duplicate weights correctly across gpus. hacky workaround
@@ -171,21 +171,21 @@ class training_wrapper_class(torch.nn.Module):
             self.fine_model.ray_bender = (self.ray_bender,)
             render_kwargs_train["network_fine"] = self.fine_model
         ray_bending_latents_list = self.latents
-
         ray_bending_latents_list = torch.stack(ray_bending_latents_list, dim=0).to(
             target_s.get_device()
         )  # num_latents x latent_size
         imageid_to_timestepid = torch.tensor(
             dataset_extras["imageid_to_timestepid"]
-        )  # num_images
+        ).to(ray_bending_latents_list.device)  # num_images
 
         N_rays = rays_o.shape[0]
 
         # look up additional information (autodecoder per-image ray bending latent code)
         # need to add this information dynamically here with indexing because otherwise values are not refreshed properly (e.g. if latent codes are concatenated to rays only once at the very start of training)
         additional_pixel_information = {}
+
         additional_pixel_information["ray_bending_latents"] = ray_bending_latents_list[
-            imageid_to_timestepid[batch_pixel_indices[:, 0]], :
+            imageid_to_timestepid[metadata[1]], :
         ]  # shape: samples x latent_size
 
         # regularizers setup
@@ -210,7 +210,7 @@ class training_wrapper_class(torch.nn.Module):
         trans = extras["raw"][..., -1]
         loss = img_loss  # shape: N_rays
         psnr = mse2psnr(img_loss)
-
+        
         if "rgb0" in extras:
             img_loss0 = img2mse(extras["rgb0"], target_s, N_rays)
             loss = loss + img_loss0
@@ -444,7 +444,7 @@ def render_path(
             new_intrin["center_y"] = new_intrin["center_y"] / render_factor
             new_intrinsics.append(new_intrin)
         intrinsics = new_intrinsics
-
+        assert False, f"intrinsics {intrinsics}"
     rgbs = []
     disps = []
     all_details_and_rest = []
@@ -1018,7 +1018,7 @@ def config_parser():
     parser.add_argument(
         "--N_rand",
         type=int,
-        default=32 * 32 * 4,
+        default=32 * 32 * 32,
         help="batch size (number of random rays per gradient step)",
     )
     parser.add_argument("--lrate", type=float, default=5e-4, help="learning rate")
@@ -1037,7 +1037,7 @@ def config_parser():
     parser.add_argument(
         "--netchunk",
         type=int,
-        default=1024 * 64,
+        default=1024 * 64*64*64,
         help="number of pts sent through network in parallel, decrease if running out of memory",
     )
     parser.add_argument(
@@ -1222,15 +1222,16 @@ def config_parser():
 def _get_multi_view_helper_mappings(num_images, datadir):
     imgnames = range(num_images)
     extras = {}
-    
     multi_view_mapping = os.path.join(datadir, "image_to_camera_id_and_timestep.json")
     if os.path.exists(multi_view_mapping):
         extras["is_multiview"] = True
         import json
         with open(multi_view_mapping, "r") as multi_view_mapping:
             multi_view_mapping = json.load(multi_view_mapping)
+
     else:
         extras["is_multiview"] = False
+
         multi_view_mapping = dict([ (name, [i, i]) for i, name in enumerate(imgnames) ])
 
     sorted_multi_view_mapping = {}
@@ -1241,17 +1242,14 @@ def _get_multi_view_helper_mappings(num_images, datadir):
     extras["raw_multi_view_mapping"] = sorted_multi_view_mapping
 
     # convert to consecutive numerical ids
-
     all_timesteps = sorted(
         list(set([timestep for view, timestep in raw_multi_view_list]))
     )
     timestep_to_timestepid = dict(
         [(timestep, i) for i, timestep in enumerate(all_timesteps)]
     )
-
     all_views = sorted(list(set([view for view, timestep in raw_multi_view_list])))
     view_to_viewid = dict([(view, i) for i, view in enumerate(all_views)])
-
     extras["raw_timesteps"] = all_timesteps
     extras["rawtimestep_to_timestepid"] = timestep_to_timestepid
     extras["raw_views"] = all_views
@@ -1259,6 +1257,9 @@ def _get_multi_view_helper_mappings(num_images, datadir):
     extras["raw_multi_view_list"] = raw_multi_view_list
     extras["imageid_to_viewid"] = [
         view_to_viewid[view] for view, timestep in raw_multi_view_list
+    ]
+    extras["imageid_to_view"] = [
+        view for view, timestep in raw_multi_view_list
     ]
     extras["imageid_to_timestepid"] = [
         timestep_to_timestepid[timestep] for view, timestep in raw_multi_view_list
@@ -1291,7 +1292,6 @@ def get_full_resolution_intrinsics(args, dataset_extras):
                 }
 
             intrinsics[raw_view] = camera
-
     else: # monocular
         def _get_info(image_folder):
             imgdir = os.path.join(args.datadir, image_folder)
@@ -1335,7 +1335,7 @@ def main_function(args):
 
     if args.dataset_type == "llff":
         #images, poses, bds, render_poses, i_test = load_llff_data_multi_view(
-        images, poses, bds, render_poses, i_test = load_llff_data(
+        images, poses, bds, render_poses, i_test = load_llff_data_multi_view(
             args.datadir,
             factor=args.factor,
             recenter=True,
@@ -1344,7 +1344,6 @@ def main_function(args):
         )
         dataset_extras = _get_multi_view_helper_mappings(images.shape[0], args.datadir)
         intrinsics, image_folder = get_full_resolution_intrinsics(args, dataset_extras)
-        
         hwf = poses[0, :3, -1]
         poses = poses[:, :3, :4]
         print("Loaded llff", images.shape, render_poses.shape, hwf, args.datadir)
@@ -1366,6 +1365,7 @@ def main_function(args):
             camera["center_y"] /= args.factor
         # modify "intrinsics" mapping to use viewid instead of raw_view
         for raw_view in list(intrinsics.keys()):
+            # assert False, f"dataset_extras {dataset_extras.keys()}"
             viewid = dataset_extras["rawview_to_viewid"][raw_view]
             new_entry = intrinsics[raw_view]
             del intrinsics[raw_view]
@@ -1489,36 +1489,29 @@ def main_function(args):
     scripts_dict["max_nerf_volume_point"] = max_point.detach().cpu().numpy().tolist()
 
     # Move testing data to GPU
-    render_poses = torch.Tensor(render_poses).cuda()
-
+    # render_poses = torch.Tensor(render_poses).cuda()
     # Prepare raybatch tensor if batching random rays
+
     N_rand = args.N_rand
+    dataloader = get_simulation_collision_dataset("data/ball_sequence_multiview",args.N_rand)
+ 
     # For random ray batching
-    print("get rays")
-    rays = np.stack([get_rays_np(p, intrinsics[dataset_extras["imageid_to_viewid"][imageid]]) for imageid, p in enumerate(poses[:,:3,:4])], 0) # [N, ro+rd, H, W, 3]
-    print("done, concats")
+    # print("get rays")
+    # rays = np.stack([get_rays_np(p, intrinsics[dataset_extras["imageid_to_viewid"][imageid]]) for imageid, p in enumerate(poses[:,:3,:4])], 0) # [N, ro+rd, H, W, 3]
+    # print("done, concats")
 
-    # attach index information (index among all images in dataset, x and y coordinate)
-    image_indices, y_coordinates, x_coordinates = np.meshgrid(
-        np.arange(images.shape[0]), np.arange(intrinsics[0]["height"]), np.arange(intrinsics[0]["width"]), indexing="ij"
-    )  # keep consistent with code in get_rays and get_rays_np. (0,0,0) is coordinate of the top-left corner of the first image, i.e. of [0,0,0]. each array has shape images x height x width
-    additional_indices = np.stack(
-        [image_indices, x_coordinates, y_coordinates], axis=-1
-    )  # N x height x width x 3 (image, x, y)
-
-    rays_rgb = np.concatenate(
-        [rays, images[:, None], additional_indices[:, None]], 1
-    )  # [N, ro+rd+rgb+ind, H, W, 3]
-
-    rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb+ind, 3]
+    # rays_rgb = np.concatenate(
+    #     [rays, images[:, None]], 1
+    # )  # [N, ro+rd+rgb, H, W, 3]
+    # rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb+ind, 3]
 
     # use all images
     # keep shape N x H x W x ro+rd+rgb x 3
-    rays_rgb = rays_rgb.astype(np.float32)
-    print(rays_rgb.shape)
+    # rays_rgb = rays_rgb.astype(np.float32)
+    # print(rays_rgb.shape)
 
     # Move training data to GPU
-    poses = torch.Tensor(poses).cuda()
+    # poses = torch.Tensor(poses).cuda()
 
     # N_iters = 200000 + 1
     N_iters = args.N_iters + 1
@@ -1543,414 +1536,417 @@ def main_function(args):
         # Sample random ray batch
         # Random over all images
         # use np random to samples N_rand random image IDs, x and y values
-        image_indices = np.random.randint(images.shape[0], size=args.N_rand)
-        x_coordinates = np.random.randint(intrinsics[0]["width"], size=args.N_rand)
-        y_coordinates = np.random.randint(intrinsics[0]["height"], size=args.N_rand)
 
-        # index rays_rgb with those values
-        batch = rays_rgb[
-            image_indices, y_coordinates, x_coordinates
-        ]  # batch x ro+rd+rgb+ind x 3
+        # image_indices = np.random.randint(images.shape[0], size=args.N_rand)
+        # x_coordinates = np.random.randint(intrinsics[0]["width"], size=args.N_rand)
+        # y_coordinates = np.random.randint(intrinsics[0]["height"], size=args.N_rand)
 
-        # push to cuda, create batch_rays, target_s, batch_pixel_indices
-        batch_pixel_indices = (
-            torch.Tensor(
-                np.stack([image_indices, x_coordinates, y_coordinates], axis=-1)
+        # # index rays_rgb with those values
+        # batch = rays_rgb[
+        #     image_indices, y_coordinates, x_coordinates
+        # ]  # batch x ro+rd+rgb+ind x 3
+
+        # # push to cuda, create batch_rays, target_s, batch_pixel_indices
+        # batch_pixel_indices = (
+        #     torch.Tensor(
+        #         np.stack([image_indices, x_coordinates, y_coordinates], axis=-1)
+        #     )
+        #     .cuda()
+        #     .long()
+        # )  # batch x 3
+        for batch,metadata in dataloader:
+            
+            batch = torch.transpose(torch.Tensor(batch).cuda(), 0, 1)  # 4 x batch x 3
+            batch_rays, target_s = batch[:2], batch[2]
+            losses = parallel_training(
+                args,
+                batch_rays[0],
+                batch_rays[1],
+                i,
+                render_kwargs_train,
+                target_s,
+                global_step,
+                start,
+                dataset_extras,
+                metadata
             )
-            .cuda()
-            .long()
-        )  # batch x 3
-        batch = torch.transpose(torch.Tensor(batch).cuda(), 0, 1)  # 4 x batch x 3
-        batch_rays, target_s = batch[:2], batch[2]
 
-        losses = parallel_training(
-            args,
-            batch_rays[0],
-            batch_rays[1],
-            i,
-            render_kwargs_train,
-            target_s,
-            global_step,
-            start,
-            dataset_extras,
-            batch_pixel_indices,
-        )
+            # losses will have shape N_rays
+            all_test_images_indicator = torch.zeros(images.shape[0], dtype=np.long).cuda()
+            all_test_images_indicator[i_test] = 1
+            all_training_images_indicator = torch.zeros(
+                images.shape[0], dtype=np.long
+            ).cuda()
+            # assert False, f"i_train {i_train} i_test {i_test}"
+            all_training_images_indicator[i_train] = 1
+            # index with image IDs of the N_rays rays to determine weights
+            # current_test_images_indicator = all_test_images_indicator[
+                # image_indices
+            # ]  # N_rays
+            # current_training_images_indicator = all_training_images_indicator[
+                # image_indices
+            # ]  # N_rays
 
-        # losses will have shape N_rays
-        all_test_images_indicator = torch.zeros(images.shape[0], dtype=np.long).cuda()
-        all_test_images_indicator[i_test] = 1
-        all_training_images_indicator = torch.zeros(
-            images.shape[0], dtype=np.long
-        ).cuda()
-        all_training_images_indicator[i_train] = 1
-        # index with image IDs of the N_rays rays to determine weights
-        current_test_images_indicator = all_test_images_indicator[
-            image_indices
-        ]  # N_rays
-        current_training_images_indicator = all_training_images_indicator[
-            image_indices
-        ]  # N_rays
+            # first, test_images (if sampled image IDs give non-empty indicators). mask N_rays loss with indicators, then take mean and loss backward with retain_graph=True. then None ray_bender (if existent) and Nerf grads
+            # if ray_bender is not None and torch.sum(current_test_images_indicator) > 0:
+            #     masked_loss = current_test_images_indicator * losses  # N_rays
+            #     masked_loss = torch.mean(masked_loss)
+            #     masked_loss.backward(retain_graph=True)
+            #     for weights in (
+            #         list(coarse_model.parameters())
+            #         + list([] if fine_model is None else fine_model.parameters())
+            #         + list([] if ray_bender is None else ray_bender.parameters())
+            #     ):
+            #         weights.grad = None
+            # next, training images (always). mask N_rays loss with indicators, then take mean and loss backward WITHOUT retain_graph=True
+            # masked_loss = current_training_images_indicator * losses  # N_rays
+            masked_loss = losses.mean()
+            masked_loss.backward(retain_graph=False)
+            # assert False, f"losses {losses.shape}"
+            optimizer.step()
 
-        # first, test_images (if sampled image IDs give non-empty indicators). mask N_rays loss with indicators, then take mean and loss backward with retain_graph=True. then None ray_bender (if existent) and Nerf grads
-        if ray_bender is not None and torch.sum(current_test_images_indicator) > 0:
-            masked_loss = current_test_images_indicator * losses  # N_rays
-            masked_loss = torch.mean(masked_loss)
-            masked_loss.backward(retain_graph=True)
-            for weights in (
-                list(coarse_model.parameters())
-                + list([] if fine_model is None else fine_model.parameters())
-                + list([] if ray_bender is None else ray_bender.parameters())
-            ):
-                weights.grad = None
-        # next, training images (always). mask N_rays loss with indicators, then take mean and loss backward WITHOUT retain_graph=True
-        masked_loss = current_training_images_indicator * losses  # N_rays
-        masked_loss = torch.mean(masked_loss)
-        masked_loss.backward(retain_graph=False)
+            if DEBUG:
+                if torch.isnan(losses).any() or torch.isinf(losses).any():
+                    raise RuntimeError(str(losses))
+                if torch.isnan(target_s).any() or torch.isinf(target_s).any():
+                    raise RuntimeError(str(torch.sum(target_s)) + " " + str(target_s))
+                norm_type = 2.0
+                total_gradient_norm = 0
+                for p in (
+                    list(coarse_model.parameters())
+                    + list(fine_model.parameters())
+                    + list(ray_bender.parameters())
+                    + list(ray_bending_latents_list)
+                ):
+                    if p.requires_grad and p.grad is not None:
+                        param_norm = p.grad.data.norm(norm_type)
+                        total_gradient_norm += param_norm.item() ** norm_type
+                total_gradient_norm = total_gradient_norm ** (1.0 / norm_type)
+                print(total_gradient_norm, flush=True)
 
-        optimizer.step()
+            # NOTE: IMPORTANT!
+            ###   update learning rate   ###
+            decay_rate = 0.1
+            decay_steps = args.lrate_decay
+            new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
+            warming_up = 1000
+            if (
+                global_step < warming_up
+            ):  # in case images are very dark or very bright, need to keep network from initially building up so much momentum that it kills the gradient
+                new_lrate /= 20.0 * (-(global_step - warming_up) / warming_up) + 1.0
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = new_lrate
+            ################################
 
-        if DEBUG:
-            if torch.isnan(losses).any() or torch.isinf(losses).any():
-                raise RuntimeError(str(losses))
-            if torch.isnan(target_s).any() or torch.isinf(target_s).any():
-                raise RuntimeError(str(torch.sum(target_s)) + " " + str(target_s))
-            norm_type = 2.0
-            total_gradient_norm = 0
-            for p in (
-                list(coarse_model.parameters())
-                + list(fine_model.parameters())
-                + list(ray_bender.parameters())
-                + list(ray_bending_latents_list)
-            ):
-                if p.requires_grad and p.grad is not None:
-                    param_norm = p.grad.data.norm(norm_type)
-                    total_gradient_norm += param_norm.item() ** norm_type
-            total_gradient_norm = total_gradient_norm ** (1.0 / norm_type)
-            print(total_gradient_norm, flush=True)
-
-        # NOTE: IMPORTANT!
-        ###   update learning rate   ###
-        decay_rate = 0.1
-        decay_steps = args.lrate_decay
-        new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
-        warming_up = 1000
-        if (
-            global_step < warming_up
-        ):  # in case images are very dark or very bright, need to keep network from initially building up so much momentum that it kills the gradient
-            new_lrate /= 20.0 * (-(global_step - warming_up) / warming_up) + 1.0
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = new_lrate
-        ################################
-
-        dt = time.time() - time0
-        log_string = (
-            "Step: "
-            + str(global_step)
-            + ", total loss: "
-            + str(losses.mean().cpu().detach().numpy())
-        )
-        if "img_loss0" in locals():
-            log_string += ", coarse loss: " + str(
-                img_loss0.mean().cpu().detach().numpy()
+            dt = time.time() - time0
+            log_string = (
+                "Step: "
+                + str(global_step)
+                + ", total loss: "
+                + str(losses.mean().cpu().detach().numpy())
             )
-        if "img_loss" in locals():
-            log_string += ", fine loss: " + str(img_loss.mean().cpu().detach().numpy())
-        if "offsets_loss" in locals():
-            log_string += ", offsets: " + str(
-                offsets_loss.mean().cpu().detach().numpy()
-            )
-        if "divergence_loss" in locals():
-            log_string += ", div: " + str(divergence_loss.mean().cpu().detach().numpy())
-        log_string += ", time: " + str(dt)
-        print(log_string, flush=True)
-
-        # Rest is logging
-        if i % args.i_weights == 0:
-
-            all_latents = torch.zeros(0)
-            for l in ray_bending_latents_list:
-                all_latents = torch.cat([all_latents, l.cpu().unsqueeze(0)], 0)
-
-            if i % 50000 == 0:
-                store_extra = True
-                path = os.path.join(logdir, "{:06d}.tar".format(i))
-            else:
-                store_extra = False
-                path = os.path.join(logdir, "latest.tar")
-            torch.save(
-                {
-                    "global_step": global_step,
-                    "network_fn_state_dict": render_kwargs_train[
-                        "network_fn"
-                    ].state_dict(),
-                    "network_fine_state_dict": None
-                    if render_kwargs_train["network_fine"] is None
-                    else render_kwargs_train["network_fine"].state_dict(),
-                    "ray_bender_state_dict": None
-                    if render_kwargs_train["ray_bender"] is None
-                    else render_kwargs_train["ray_bender"].state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "ray_bending_latent_codes": all_latents,  # shape: frames x latent_size
-                    "intrinsics": intrinsics,
-                    "scripts_dict": scripts_dict,
-                    "dataset_extras": dataset_extras,
-                },
-                path,
-            )
-            del all_latents
-
-            if store_extra:
-                shutil.copyfile(path, os.path.join(logdir, "latest.tar"))
-
-            print("Saved checkpoints at", path)
-
-        if i % args.i_video == 0 and i > 0:
-            # Turn on testing mode
-            print("rendering test set...", flush=True)
-            if len(render_poses) > 0 and len(i_test) > 0 and not dataset_extras["is_multiview"]:
-                with torch.no_grad():
-                    if args.render_test:
-                        rendering_latents = ray_bending_latents = [
-                            ray_bending_latents_list[
-                                dataset_extras["imageid_to_timestepid"][i]
-                            ]
-                            for i in i_test
-                        ]
-                    else:
-                        rendering_latents = ray_bending_latents = [
-                            ray_bending_latents_list[
-                                dataset_extras["imageid_to_timestepid"][i_test[0]]
-                            ]
-                            for _ in range(len(render_poses))
-                        ]
-                    rgbs, disps = render_path(
-                        render_poses,
-                        [intrinsics[0] for _ in range(len(render_poses))],
-                        args.chunk,
-                        render_kwargs_test,
-                        ray_bending_latents=rendering_latents,
-                        parallelized_render_function=parallel_render,
-                    )
-                print("Done, saving", rgbs.shape, disps.shape)
-                moviebase = os.path.join(logdir, "{}_spiral_{:06d}_".format(expname, i))
-                try:
-                    imageio.mimwrite(
-                        moviebase + "rgb.mp4", to8b(rgbs), fps=30, quality=8
-                    )
-                    imageio.mimwrite(
-                        moviebase + "disp.mp4",
-                        to8b(disps / np.max(disps)),
-                        fps=30,
-                        quality=8,
-                    )
-                    imageio.mimwrite(
-                        moviebase + "disp_jet.mp4",
-                        to8b(
-                            np.stack(
-                                [
-                                    visualize_disparity_with_jet_color_scheme(
-                                        disp / np.max(disp)
-                                    )
-                                    for disp in disps
-                                ],
-                                axis=0,
-                            )
-                        ),
-                        fps=30,
-                        quality=8,
-                    )
-                    imageio.mimwrite(
-                        moviebase + "disp_phong.mp4",
-                        to8b(
-                            np.stack(
-                                [
-                                    visualize_disparity_with_blinn_phong(
-                                        disp / np.max(disp)
-                                    )
-                                    for disp in disps
-                                ],
-                                axis=0,
-                            )
-                        ),
-                        fps=30,
-                        quality=8,
-                    )
-                except:
-                    print(
-                        "imageio.mimwrite() failed. maybe ffmpeg is not installed properly?"
-                    )
-
-            if i >= N_iters + 1 - args.i_video:
-                print("rendering full training set...", flush=True)
-                with torch.no_grad():
-                    rgbs, disps = render_path(
-                        poses[i_train],
-                        [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_train],
-                        args.chunk,
-                        render_kwargs_test,
-                        ray_bending_latents=[
-                            ray_bending_latents_list[
-                                dataset_extras["imageid_to_timestepid"][i]
-                            ]
-                            for i in i_train
-                        ],
-                        parallelized_render_function=parallel_render,
-                    )
-                print("Done, saving", rgbs.shape, disps.shape)
-                moviebase = os.path.join(
-                    logdir, "{}_training_{:06d}_".format(expname, i)
+            if "img_loss0" in locals():
+                log_string += ", coarse loss: " + str(
+                    img_loss0.mean().cpu().detach().numpy()
                 )
-                try:
-                    imageio.mimwrite(
-                        moviebase + "rgb.mp4", to8b(rgbs), fps=30, quality=8
-                    )
-                    imageio.mimwrite(
-                        moviebase + "disp.mp4",
-                        to8b(disps / np.max(disps)),
-                        fps=30,
-                        quality=8,
-                    )
-                    imageio.mimwrite(
-                        moviebase + "disp_jet.mp4",
-                        to8b(
-                            np.stack(
-                                [
-                                    visualize_disparity_with_jet_color_scheme(
-                                        disp / np.max(disp)
-                                    )
-                                    for disp in disps
-                                ],
-                                axis=0,
-                            )
-                        ),
-                        fps=30,
-                        quality=8,
-                    )
-                    imageio.mimwrite(
-                        moviebase + "disp_phong.mp4",
-                        to8b(
-                            np.stack(
-                                [
-                                    visualize_disparity_with_blinn_phong(
-                                        disp / np.max(disp)
-                                    )
-                                    for disp in disps
-                                ],
-                                axis=0,
-                            )
-                        ),
-                        fps=30,
-                        quality=8,
-                    )
-                except:
-                    print(
-                        "imageio.mimwrite() failed. maybe ffmpeg is not installed properly?"
-                    )
-
-        if i % args.i_testset == 0 and i > 0:
-            trainsubsavedir = os.path.join(logdir, "trainsubset_{:06d}".format(i))
-            os.makedirs(trainsubsavedir, exist_ok=True)
-            i_train_sub = i_train
-            if i >= N_iters + 1 - args.i_video:
-                i_train_sub = i_train_sub
-            else:
-                i_train_sub = i_train_sub[
-                    :: np.maximum(1, int((len(i_train_sub) / len(i_test)) + 0.5))
-                ]
-            print("i_train_sub poses shape", poses[i_train_sub].shape)
-            with torch.no_grad():
-                render_path(
-                    poses[i_train_sub],
-                    [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_train_sub],
-                    args.chunk,
-                    render_kwargs_test,
-                    gt_imgs=images[i_train_sub],
-                    savedir=trainsubsavedir,
-                    detailed_output=True,
-                    ray_bending_latents=[
-                        ray_bending_latents_list[
-                            dataset_extras["imageid_to_timestepid"][i]
-                        ]
-                        for i in i_train_sub
-                    ],
-                    parallelized_render_function=parallel_render,
+            if "img_loss" in locals():
+                log_string += ", fine loss: " + str(img_loss.mean().cpu().detach().numpy())
+            if "offsets_loss" in locals():
+                log_string += ", offsets: " + str(
+                    offsets_loss.mean().cpu().detach().numpy()
                 )
-            print("Saved some training images")
+            if "divergence_loss" in locals():
+                log_string += ", div: " + str(divergence_loss.mean().cpu().detach().numpy())
+            log_string += ", time: " + str(dt)
+            print(log_string, flush=True)
 
-            if len(i_test) > 0:
-                testsavedir = os.path.join(logdir, "testset_{:06d}".format(i))
-                os.makedirs(testsavedir, exist_ok=True)
-                print("test poses shape", poses[i_test].shape)
+            # Rest is logging
+            if i % args.i_weights == 0:
+
+                all_latents = torch.zeros(0)
+                for l in ray_bending_latents_list:
+                    all_latents = torch.cat([all_latents, l.cpu().unsqueeze(0)], 0)
+
+                if i % 50000 == 0:
+                    store_extra = True
+                    path = os.path.join(logdir, "{:06d}.tar".format(i))
+                else:
+                    store_extra = False
+                    path = os.path.join(logdir, "latest.tar")
+                torch.save(
+                    {
+                        "global_step": global_step,
+                        "network_fn_state_dict": render_kwargs_train[
+                            "network_fn"
+                        ].state_dict(),
+                        "network_fine_state_dict": None
+                        if render_kwargs_train["network_fine"] is None
+                        else render_kwargs_train["network_fine"].state_dict(),
+                        "ray_bender_state_dict": None
+                        if render_kwargs_train["ray_bender"] is None
+                        else render_kwargs_train["ray_bender"].state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "ray_bending_latent_codes": all_latents,  # shape: frames x latent_size
+                        "intrinsics": intrinsics,
+                        "scripts_dict": scripts_dict,
+                        "dataset_extras": dataset_extras,
+                    },
+                    path,
+                )
+                del all_latents
+
+                if store_extra:
+                    shutil.copyfile(path, os.path.join(logdir, "latest.tar"))
+
+                print("Saved checkpoints at", path)
+
+            if i % args.i_video == 0 and i > 0:
+                # Turn on testing mode
+                print("rendering test set...", flush=True)
+                if len(render_poses) > 0 and len(i_test) > 0 and not dataset_extras["is_multiview"]:
+                    with torch.no_grad():
+                        if args.render_test:
+                            rendering_latents = ray_bending_latents = [
+                                ray_bending_latents_list[
+                                    dataset_extras["imageid_to_timestepid"][i]
+                                ]
+                                for i in i_test
+                            ]
+                        else:
+                            rendering_latents = ray_bending_latents = [
+                                ray_bending_latents_list[
+                                    dataset_extras["imageid_to_timestepid"][i_test[0]]
+                                ]
+                                for _ in range(len(render_poses))
+                            ]
+                        rgbs, disps = render_path(
+                            render_poses,
+                            [intrinsics[0] for _ in range(len(render_poses))],
+                            args.chunk,
+                            render_kwargs_test,
+                            ray_bending_latents=rendering_latents,
+                            parallelized_render_function=parallel_render,
+                        )
+                    print("Done, saving", rgbs.shape, disps.shape)
+                    moviebase = os.path.join(logdir, "{}_spiral_{:06d}_".format(expname, i))
+                    try:
+                        imageio.mimwrite(
+                            moviebase + "rgb.mp4", to8b(rgbs), fps=30, quality=8
+                        )
+                        imageio.mimwrite(
+                            moviebase + "disp.mp4",
+                            to8b(disps / np.max(disps)),
+                            fps=30,
+                            quality=8,
+                        )
+                        imageio.mimwrite(
+                            moviebase + "disp_jet.mp4",
+                            to8b(
+                                np.stack(
+                                    [
+                                        visualize_disparity_with_jet_color_scheme(
+                                            disp / np.max(disp)
+                                        )
+                                        for disp in disps
+                                    ],
+                                    axis=0,
+                                )
+                            ),
+                            fps=30,
+                            quality=8,
+                        )
+                        imageio.mimwrite(
+                            moviebase + "disp_phong.mp4",
+                            to8b(
+                                np.stack(
+                                    [
+                                        visualize_disparity_with_blinn_phong(
+                                            disp / np.max(disp)
+                                        )
+                                        for disp in disps
+                                    ],
+                                    axis=0,
+                                )
+                            ),
+                            fps=30,
+                            quality=8,
+                        )
+                    except:
+                        print(
+                            "imageio.mimwrite() failed. maybe ffmpeg is not installed properly?"
+                        )
+
+                if i >= N_iters + 1 - args.i_video:
+                    print("rendering full training set...", flush=True)
+                    with torch.no_grad():
+                        rgbs, disps = render_path(
+                            poses[i_train],
+                            [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_train],
+                            args.chunk,
+                            render_kwargs_test,
+                            ray_bending_latents=[
+                                ray_bending_latents_list[
+                                    dataset_extras["imageid_to_timestepid"][i]
+                                ]
+                                for i in i_train
+                            ],
+                            parallelized_render_function=parallel_render,
+                        )
+                    print("Done, saving", rgbs.shape, disps.shape)
+                    moviebase = os.path.join(
+                        logdir, "{}_training_{:06d}_".format(expname, i)
+                    )
+                    try:
+                        imageio.mimwrite(
+                            moviebase + "rgb.mp4", to8b(rgbs), fps=30, quality=8
+                        )
+                        imageio.mimwrite(
+                            moviebase + "disp.mp4",
+                            to8b(disps / np.max(disps)),
+                            fps=30,
+                            quality=8,
+                        )
+                        imageio.mimwrite(
+                            moviebase + "disp_jet.mp4",
+                            to8b(
+                                np.stack(
+                                    [
+                                        visualize_disparity_with_jet_color_scheme(
+                                            disp / np.max(disp)
+                                        )
+                                        for disp in disps
+                                    ],
+                                    axis=0,
+                                )
+                            ),
+                            fps=30,
+                            quality=8,
+                        )
+                        imageio.mimwrite(
+                            moviebase + "disp_phong.mp4",
+                            to8b(
+                                np.stack(
+                                    [
+                                        visualize_disparity_with_blinn_phong(
+                                            disp / np.max(disp)
+                                        )
+                                        for disp in disps
+                                    ],
+                                    axis=0,
+                                )
+                            ),
+                            fps=30,
+                            quality=8,
+                        )
+                    except:
+                        print(
+                            "imageio.mimwrite() failed. maybe ffmpeg is not installed properly?"
+                        )
+
+            if i % args.i_testset == 0 and i > 0:
+                trainsubsavedir = os.path.join(logdir, "trainsubset_{:06d}".format(i))
+                os.makedirs(trainsubsavedir, exist_ok=True)
+                i_train_sub = i_train
+                if i >= N_iters + 1 - args.i_video:
+                    i_train_sub = i_train_sub
+                else:
+                    i_train_sub = i_train_sub[
+                        :: np.maximum(1, int((len(i_train_sub) / len(i_test)) + 0.5))
+                    ]
+                print("i_train_sub poses shape", poses[i_train_sub].shape)
                 with torch.no_grad():
                     render_path(
-                        poses[i_test],
-                        [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_test],
+                        poses[i_train_sub],
+                        [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_train_sub],
                         args.chunk,
                         render_kwargs_test,
-                        gt_imgs=images[i_test],
-                        savedir=testsavedir,
+                        gt_imgs=images[i_train_sub],
+                        savedir=trainsubsavedir,
                         detailed_output=True,
                         ray_bending_latents=[
                             ray_bending_latents_list[
                                 dataset_extras["imageid_to_timestepid"][i]
                             ]
-                            for i in i_test
+                            for i in i_train_sub
                         ],
                         parallelized_render_function=parallel_render,
                     )
-                print("Saved test set")
+                print("Saved some training images")
 
-        if i % args.i_print == 0:
-            if "psnr" in locals():
-                tqdm.write(
-                    f"[TRAIN] Iter: {i} Loss: {losses.mean().item()}  PSNR: {psnr.item()}"
-                )
-            else:
-                tqdm.write(f"[TRAIN] Iter: {i} Loss: {losses.mean().item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
+                if len(i_test) > 0:
+                    testsavedir = os.path.join(logdir, "testset_{:06d}".format(i))
+                    os.makedirs(testsavedir, exist_ok=True)
+                    print("test poses shape", poses[i_test].shape)
+                    with torch.no_grad():
+                        render_path(
+                            poses[i_test],
+                            [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_test],
+                            args.chunk,
+                            render_kwargs_test,
+                            gt_imgs=images[i_test],
+                            savedir=testsavedir,
+                            detailed_output=True,
+                            ray_bending_latents=[
+                                ray_bending_latents_list[
+                                    dataset_extras["imageid_to_timestepid"][i]
+                                ]
+                                for i in i_test
+                            ],
+                            parallelized_render_function=parallel_render,
+                        )
+                    print("Saved test set")
 
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
+            if i % args.i_print == 0:
+                if "psnr" in locals():
+                    tqdm.write(
+                        f"[TRAIN] Iter: {i} Loss: {losses.mean().item()}  PSNR: {psnr.item()}"
+                    )
+                else:
+                    tqdm.write(f"[TRAIN] Iter: {i} Loss: {losses.mean().item()}")
+            """
+                print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+                print('iter time {:.05f}'.format(dt))
+
+                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
+                    tf.contrib.summary.scalar('loss', loss)
+                    tf.contrib.summary.scalar('psnr', psnr)
+                    tf.contrib.summary.histogram('tran', trans)
+                    if args.N_importance > 0:
+                        tf.contrib.summary.scalar('psnr0', psnr0)
 
 
-            if i%args.i_img==0:
+                if i%args.i_img==0:
 
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
+                    # Log a rendered validation view to Tensorboard
+                    img_i=np.random.choice(i_val)
+                    target = images[img_i]
+                    pose = poses[img_i, :3,:4]
+                    with torch.no_grad():
+                        rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                            **render_kwargs_test)
 
-                psnr = mse2psnr(img2mse(rgb, target))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-                if args.N_importance > 0:
+                    psnr = mse2psnr(img2mse(rgb, target))
 
                     with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
 
-        global_step += 1
-        print("", end="", flush=True)
+                        tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
+                        tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
+                        tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
+
+                        tf.contrib.summary.scalar('psnr_holdout', psnr)
+                        tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+
+
+                    if args.N_importance > 0:
+
+                        with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+                            tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
+                            tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
+                            tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
+            """
+
+            global_step += 1
+            print("", end="", flush=True)
 
 
 def create_folder(folder):

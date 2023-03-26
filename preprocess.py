@@ -332,7 +332,6 @@ def preprocess(args):
 
         # get camera poses by running colmap
         from llff_preprocessing import gen_poses
-
         gen_poses(args.input, args.colmap_matching)
 
 
