@@ -41,29 +41,27 @@ class SimulationCollisionDataset(Dataset):
             # print(raw_view)
     def get_calibration(self):
         return self.calibration
+
     def __len__(self):
         return len(self.files)
  
     def __getitem__(self, key):
-        # print(key
-        # )
         index,x,y = key
-        # assert False, f"index {index}"
         fp = self.files[index]
         fname = fp.split("/")[-1]
         raw_view,timestep = self.image_to_camera_id_and_timestep[fname]
         pose = torch.zeros((3, 5)).to(device="cuda")
-        hwf = torch.zeros((3)).to(device="cuda")
+        hwf = torch.Tensor([768,1024,1.1726069927692815]).to(device="cuda")
         pose[:3,:3] = torch.tensor(self.calibration[raw_view]["rotation"]).to(device=pose.device)
         pose[:3,3] = torch.tensor(self.calibration[raw_view]["translation"]).to(device=pose.device)
         pose[:3,4] = hwf
         rays_o,rays_d=get_rays(pose, self.calibration[raw_view])
         img = io.read_image(fp).to(device=pose.device)
         img = img.permute((1,2,0))
-        # assert False, f"rays shape {rays_o.shape,rays_d.shape} img shape {img.shape}"
+
         rays_rgb = torch.stack((rays_o,rays_d,img),0)[:,y,x,:]
-        # assert False, f"shape {rays_rgb.shape}"
-        return rays_rgb,(raw_view,timestep)
+        return rays_rgb,(raw_view,timestep,x,y)
+
 def get_simulation_collision_dataset(path,batch_size):
     dataset = SimulationCollisionDataset("data/ball_sequence_multiview")
     Dataloader = DataLoader(dataset,batch_size=batch_size,sampler=DummySampler(dataset, dataset.get_calibration(),N_rand=batch_size))

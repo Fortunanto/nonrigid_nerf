@@ -42,7 +42,7 @@ def load_colmap_data(realdir):
     
     poses = c2w_mats[:, :3, :4].transpose([1,2,0])
     poses = np.concatenate([poses, np.tile(hwf[..., np.newaxis], [1,1,poses.shape[-1]])], 1)
-    
+    assert False, f"poses {poses[:,:,0][:,:4]}"
     points3dfile = os.path.join(realdir, 'sparse/0/points3D.bin')
     pts3d = read_model.read_points3d_binary(points3dfile)
     # must switch to [-u, r, -t] from [r, -u, t], NOT [r, u, -t]
@@ -57,7 +57,6 @@ def save_poses(basedir, poses, pts3d, perm):
     for k in pts3d:
         pts_arr.append(pts3d[k].xyz)
         cams = [0] * poses.shape[-1]
-        print(f"cams {len(cams)}")
         for ind in pts3d[k].image_ids:
             if len(cams) < ind - 1:
                 print('ERROR: the correct camera poses for current points cannot be accessed')
@@ -273,7 +272,7 @@ def gen_poses(basedir, match_type, factors=None):
     poses, pts3d, perm = load_colmap_data(basedir)
     
     save_poses(basedir, poses, pts3d, perm)
-    
+    assert False, f"poses {poses.shape}"
     if factors is not None:
         print( 'Factors:', factors)
         minify(basedir, factors)

@@ -588,7 +588,9 @@ class ray_bending(nn.Module):
 def get_rays(c2w, intrin):
     H = intrin["height"]
     W = intrin["width"]
-    device = c2w.get_device()
+    device = "cuda"
+    c2w=torch.Tensor(c2w).to(device=device)
+
     i, j = torch.meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device))  # pytorch's meshgrid has indexing='ij' # keep consistent with meshgrid run_nerf.py
     i = i.t()
     j = j.t()
@@ -619,6 +621,7 @@ def get_rays_np(c2w, intrin):
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
+    # assert False, f"here"
     return rays_o, rays_d
 
 
